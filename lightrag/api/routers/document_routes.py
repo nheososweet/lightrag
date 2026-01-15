@@ -17,6 +17,7 @@ from fastapi import (
     BackgroundTasks,
     Depends,
     File,
+    Form,
     HTTPException,
     UploadFile,
 )
@@ -1190,7 +1191,11 @@ def _extract_xlsx(file_bytes: bytes) -> str:
 
 
 async def pipeline_enqueue_file(
-    rag: LightRAG, file_path: Path, track_id: str = None
+    rag: LightRAG, 
+    file_path: Path, 
+    track_id: str = None,
+    knowledge_id: Optional[str] = None,
+    custom_file_path: Optional[str] = None
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -1198,6 +1203,8 @@ async def pipeline_enqueue_file(
         rag: LightRAG instance
         file_path: Path to the saved file
         track_id: Optional tracking ID, if not provided will be generated
+        knowledge_id: Optional custom ID to use as document ID (full_doc_id)
+        custom_file_path: Optional custom file path for storage/citation purposes
     Returns:
         tuple: (success: bool, track_id: str)
     """
@@ -1558,9 +1565,18 @@ async def pipeline_enqueue_file(
                 return False, track_id
 
             try:
-                await rag.apipeline_enqueue_documents(
-                    content, file_paths=file_path.name, track_id=track_id
-                )
+                # Use custom_file_path if provided, otherwise use original filename
+                doc_file_path = custom_file_path if custom_file_path else file_path.name
+                
+                # Use knowledge_id if provided, otherwise let the system auto-generate
+                if knowledge_id:
+                    await rag.apipeline_enqueue_documents(
+                        content, ids=[knowledge_id], file_paths=doc_file_path, track_id=track_id
+                    )
+                else:
+                    await rag.apipeline_enqueue_documents(
+                        content, file_paths=doc_file_path, track_id=track_id
+                    )
 
                 logger.info(
                     f"Successfully extracted and enqueued file: {file_path.name}"
@@ -1643,17 +1659,25 @@ async def pipeline_enqueue_file(
                 logger.error(f"Error deleting file {file_path}: {str(e)}")
 
 
-async def pipeline_index_file(rag: LightRAG, file_path: Path, track_id: str = None):
+async def pipeline_index_file(
+    rag: LightRAG, 
+    file_path: Path, 
+    track_id: str = None,
+    knowledge_id: Optional[str] = None,
+    custom_file_path: Optional[str] = None
+):
     """Index a file with track_id
 
     Args:
         rag: LightRAG instance
         file_path: Path to the saved file
         track_id: Optional tracking ID
+        knowledge_id: Optional custom ID to use for the document
+        custom_file_path: Optional custom file path for storage/citation
     """
     try:
         success, returned_track_id = await pipeline_enqueue_file(
-            rag, file_path, track_id
+            rag, file_path, track_id, knowledge_id, custom_file_path
         )
         if success:
             await rag.apipeline_process_enqueue_documents()
@@ -2069,7 +2093,10 @@ def create_document_routes(
         "/upload", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def upload_to_input_dir(
-        background_tasks: BackgroundTasks, file: UploadFile = File(...)
+        background_tasks: BackgroundTasks, 
+        file: UploadFile = File(...),
+        knowledge_id: Optional[str] = Form(None),
+        custom_file_path: Optional[str] = Form(None)
     ):
         """
         Upload a file to the input directory and index it.
@@ -2081,6 +2108,8 @@ def create_document_routes(
         Args:
             background_tasks: FastAPI BackgroundTasks for async processing
             file (UploadFile): The file to be uploaded. It must have an allowed extension.
+            knowledge_id (Optional[str]): Custom ID to use for the document instead of auto-generated hash
+            custom_file_path (Optional[str]): Custom file path for storage/citation purposes
 
         Returns:
             InsertResponse: A response object containing the upload status and a message.
@@ -2098,6 +2127,18 @@ def create_document_routes(
                     status_code=400,
                     detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
                 )
+
+            # If knowledge_id is provided, check if it already exists
+            if knowledge_id and knowledge_id.strip():
+                existing_doc_by_id = await rag.doc_status.get_by_id(knowledge_id)
+                if existing_doc_by_id:
+                    status = existing_doc_by_id.get("status", "unknown")
+                    existing_track_id = existing_doc_by_id.get("track_id") or ""
+                    return InsertResponse(
+                        status="duplicated",
+                        message=f"Document with knowledge_id '{knowledge_id}' already exists in document storage (Status: {status}).",
+                        track_id=existing_track_id,
+                    )
 
             # Check if filename already exists in doc_status storage
             existing_doc_data = await rag.doc_status.get_doc_by_file_path(safe_filename)
@@ -2127,7 +2168,9 @@ def create_document_routes(
             track_id = generate_track_id("upload")
 
             # Add to background tasks and get track_id
-            background_tasks.add_task(pipeline_index_file, rag, file_path, track_id)
+            background_tasks.add_task(
+                pipeline_index_file, rag, file_path, track_id, knowledge_id, custom_file_path
+            )
 
             return InsertResponse(
                 status="success",
